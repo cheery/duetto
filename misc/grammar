@@ -1,0 +1,189 @@
+lexemes id, integer, real, string
+
+file: statement
+    | file statement
+
+statement: "import" id
+         | "import" id "using" names
+         | "export" names
+
+names: name
+     | name "," names
+
+name: id
+    | id "⇒" id
+
+# statement: "data" id indices
+#          | "data" id indices "where" dfields
+#          | "codata" id indices "where" cfields
+#          | "record" id indices "where" rfields
+#          | "class" id indices "where" rfields
+# 
+# dfields: WFB dfield
+#        | dfields VALIGN WFB dfield
+# 
+# dfield: id indices
+# 
+# cfields: WFB cfield
+#        | cfields VALIGN WFB cfield
+# 
+# cfield: id indices "*" ":" normal
+# 
+# rfields: WFB rfield
+#        | rfields VALIGN WFB rfield
+# 
+# rfield: binders ":" normal
+
+indices:
+indices: index indices
+
+index: "(" binders ":" normal ")"
+
+statement: "def" id ":" normal
+         | "def" id "=" normal
+         | "def" id lambdabinders "=" normal
+
+normal: term
+      | structdef term "→" normal
+      | term "→" normal
+      | structdef "(" id ":" normal ")" "→" normal
+      | "(" id ":" normal ")" "→" normal
+      | term "≡" term
+      | "⟦" normal "⟧" term "≡" term 
+      | term ":" normal
+      | "-" normal
+
+terms: term
+     | term "," terms
+
+term: lambda
+    
+lambda: monad
+      | "λ" lambdabinders "." lambda
+      | "∃" binders "." lambda
+
+monad: let
+     | let ";" monad
+     | id "←" cocase ";" monad
+
+let: cocase
+     | id "is" cocase ";" let
+
+cocase: disj
+      | id "↦" cocase
+      | "⟮" cases "⟯"
+
+disj: conj2
+    | conj2 "⊔" disj
+
+conj2: disj2
+    | disj2 "⊓" conj2
+
+disj2: conj
+     | conj "∨" disj2
+
+conj: not
+    | not "∧" conj
+
+not: equals
+   | "¬" not
+
+# λx y z. λx.λy.λz.a b c
+# bar hax = ∃x y z. foo ∘ blah ∘ bluh ∧ %bar hax ⊔ guux ∧ x=y ∧ {holder}
+# foo; x=bar; z=guux; zip; zap
+# x=foo; y=bar; zip
+
+equals: comp
+      | comp "<" comp
+      | comp ">" comp
+      | comp "≤" comp
+      | comp "≥" comp
+      | comp "=" comp
+      | comp "≠" comp
+
+comp: add
+    | add "∘" comp
+
+add: mul
+   | mul "+" add
+   | mul "-" add
+
+mul: prefix
+   | prefix "*" mul
+   | prefix "/" mul
+
+prefix: exp
+      | "~" prefix
+
+exp: call
+   | call "^" exp
+
+call: prim
+    | call struct prim
+    | call "⟮" cases "⟯"
+    | call "⟦" normal "⟧" "⟮" cases "⟯"
+
+prim: id
+    | "(" normal ")"
+    | "⋆"
+    | integer
+    | real
+    | string
+    | "{" "}"
+    | "{" terms "}"
+    | "{" labterms "}"
+    | "{" labterms "|" normal "}"
+    | "[" "]"
+    | "[" terms "]"
+    | "[" terms "|" term "]"
+
+struct:
+struct: "⟨" "⟩"
+      | "⟨" labterms "⟩"
+      | "⟨" terms "⟩"
+
+structdef: "⟨" "⟩"
+         | "⟨" labtypes "⟩"
+
+structbind:
+structbind: "⟨" "⟩"
+          | "⟨" labbinds "⟩"
+
+labterms: labterm
+labterms: labterm "," labterms
+
+labterm: id "=" normal
+
+labtypes: labtype
+labtypes: labtype "," labtypes
+
+labtype: id ":" normal
+
+labbinds: labbind
+        | labbind "," labbinds
+
+labbind: id
+
+cases: case
+     | case "," cases
+
+case: id binders0 "⇒" normal
+
+binders0:
+binders0: binders
+
+binders: id
+       | id binders
+       | "◊" id
+       | "◊" id binders
+
+defbinders: defbinder
+          | defbinder defbinders
+
+defbinder: id
+defbinder: structdef id
+
+lambdabinders: lambdabinder
+             | lambdabinder lambdabinders
+
+lambdabinder: structbind id
