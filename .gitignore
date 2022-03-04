@@ -1,0 +1,8 @@
+.*.swp
+.*.swo
+*.pyc
+*.hi
+*.o
+dist-newstyle
+duetto
+trash

@@ -18,11 +18,11 @@ extra-source-files:  CHANGELOG.md
 
 executable duetto
   main-is:             Main.hs
-  other-modules:       Trail, Tokenize, LR, LRRep, Rep
+  other-modules:       Evaluator, LRRep, Rep, Tokenize, Transform,
+                       LR, Solver, Trail
   -- other-extensions:
-  build-depends:       base >=4.13 && <4.14,
+  build-depends:       base >=4.13 && <4.17,
                        containers,
                        mtl
   hs-source-dirs:      src
   default-language:    Haskell2010
-  ghc-options:         -fmax-pmcheck-iterations=20000000

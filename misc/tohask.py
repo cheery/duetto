@@ -98,6 +98,7 @@ for index, table in enumerate(tables.state):
             if sym not in gotos:
                 gotos[sym] = {}
             gotos[sym][index] = (act, arg)
+print "run' _ _ _ = pure Nothing"
 
 for name, table in gotos.iteritems():
     print "\ngoto{} :: Status a -> (C{} a) -> Parser (Maybe [Statement])".format(name.title(), name)

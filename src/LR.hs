@@ -7071,6 +7071,7 @@ run' S222 stack (TKeyword "⟯") = case stack of
 run' S222 stack (TKeyword ",") = case stack of
     (Snormal (Skeyword (Skeyword (Snormal (Skeyword (Sid (Skeyword (Sstructdef stack s x0) _) _ x1) _) _ x2) _) _) _ x3) ->
         gotoNormal s (Snormal stack s (reduction19 x0 x1 x2 x3))
+run' _ _ _ = pure Nothing
 
 gotoPrim :: Status a -> (Cprim a) -> Parser (Maybe [Statement])
 gotoPrim S16 = run S29

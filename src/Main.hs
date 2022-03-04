@@ -1,10 +1,19 @@
 module Main where
 
+import Control.Monad.State
 import System.Environment
 import Trail
 import LR
 import Tokenize
 import Rep
+import Evaluator
+import Solver
+import qualified Solver as S
+import qualified Data.Set as Set
+import qualified Data.Map as Map
+import Debug.Trace
+import Transform (Entry(..), scc', preorder, Graph, Table)
+--import Data.Foldable (all)
 
 readStatements :: String -> Either String [Statement]
 readStatements contents = do
@@ -12,18 +21,112 @@ readStatements contents = do
     case parse tokens of
         (Just statements, []) -> pure statements
         (_, ((_,(x,y),_):_)) -> Left $ "could not parse col " ++ show x ++ " line " ++ show y
+        (_, []) -> Left $ "file truncated"
 
 main :: IO ()
 main = do
     args <- getArgs
-
     case args of
         (x:xs) -> do
             contents <- readFile x
             case readStatements contents of
                 Left s -> putStrLn s
-                Right stmts -> putStrLn (show stmts)
+                Right stmts -> do_stuff_with stmts
 
+runSample = do
+    contents <- readFile "../sample"
+    case readStatements contents of
+        Left s -> putStrLn s
+        Right stmts -> do_stuff_with stmts
+
+do_stuff_with stmts = do
+    let table = statement_table stmts
+    let order = (map preorder $ scc' $ dependency_graph stmts)
+    let sol = Solver Map.empty Map.empty Map.empty Map.empty []
+    proto_elaborate' order table sol 
+    -- putStrLn (show order)
+    -- proto_elaborate stmts
+
+dependency_graph :: [Statement] -> Graph
+dependency_graph [] = mempty
+dependency_graph (TypeDecl name term:stmts) =
+    Map.insert (TypeOf name) depList dep
+    where depList = map DeclOf (Set.toList (fcv term))
+          dep = dependency_graph stmts
+dependency_graph (Decl name term:stmts) =
+    Map.insert (DeclOf name) depList dep
+    where depList = TypeOf name
+                  : map DeclOf (Set.toList (fcv term))
+          dep = dependency_graph stmts
+dependency_graph (_:stmts) = dependency_graph stmts
+
+statement_table :: [Statement] -> Table Statement
+statement_table [] = mempty
+statement_table (TypeDecl name term:stmts) =
+    Map.insert (TypeOf name) (TypeDecl name term) (statement_table stmts)
+statement_table (Decl name term:stmts) =
+    Map.insert (DeclOf name) (Decl name term) (statement_table stmts)
+statement_table (_:stmts) = statement_table stmts
+
+proto_elaborate' :: [[Entry]] -> Table Statement -> Solver -> IO ()
+proto_elaborate' [] table sol = pure ()
+proto_elaborate' ([e]:rest) table sol = do
+    case Map.lookup e table of
+        Just (TypeDecl name term) -> do
+            putStrLn $ "elab on tdecl " ++ name
+            let (u, sol') = runContext sol (elaborate B0 baseMapping term Star)
+            let sol'' = solve sol'
+            let u' = nf (toNs sol'' True) u 0
+            if Set.size (fmvs u') + length (constraints sol) == 0
+            then do
+                putStrLn $ "success: " ++ show u'
+                let sol''' = sol'' { types = Map.insert name u' (types sol'') }
+                proto_elaborate' rest table sol'''
+            else do 
+                putStrLn $ "failure: " ++ show u'
+                mapM_ (\(_,C _ _ t t' _ _) -> do
+                    putStrLn $ show t ++ " = " ++ show t'
+                    ) (constraints sol'')
+        Just (Decl name term) -> do
+            putStrLn $ "elab on decl " ++ name
+            case Map.lookup name (types sol) of
+                Just ty -> do
+                    let (u, sol') = runContext sol (elaborate B0 baseMapping term ty)
+                    let sol'' = solve sol'
+                    let u' = nf (toNs sol'' False) u 0
+                    if Set.size (fmvs u') + length (constraints sol) == 0
+                    then do
+                        putStrLn $ "success: " ++ show u'
+                        let u'' = eval (toNs sol'' True) [] u'
+                        let sol''' = sol'' { Solver.constants = Map.insert name (False, u'') (Solver.constants sol'') }
+                        proto_elaborate' rest table sol'''
+                    else do
+                        putStrLn $ "failure: " ++ show u'
+                        mapM_ (\(_,C _ _ t t' _ _) -> do
+                            putStrLn $ show t ++ " = " ++ show t'
+                            ) (constraints sol'')
+                        proto_elaborate' rest table sol''
+                Nothing -> do
+                    putStrLn $ "no type for " ++ name
+                    proto_elaborate' rest table sol
+        Nothing -> pure ()
+
+proto_elaborate :: [Statement] -> IO ()
+proto_elaborate [] = pure ()
+proto_elaborate (TypeDecl name term:rest) = do
+    putStrLn $ "elab on " ++ name
+    let sol = Solver Map.empty Map.empty Map.empty Map.empty []
+    let (u, sol') = runContext sol (do
+                        let m = baseMapping
+                        elaborate B0 m term Star)
+    let sol'' = solve sol'
+    putStrLn $ "result " ++ show (nf (toNs sol'' False) u 0)
+    mapM_ (\(_,C _ _ t t' _ _) -> do
+        putStrLn $ show t ++ " = " ++ show t'
+        ) (constraints sol'')
+    proto_elaborate rest
+proto_elaborate (stmt:rest) =
+    proto_elaborate rest
 
 -- import Data.Set as Set (Set, singleton, unions, union, member, isSubsetOf)
 -- import qualified Data.Set as Set
@@ -31,7 +134,6 @@ main = do
 -- import Data.List (unionBy)
 -- import Data.Function (on)
 -- import Data.Foldable (fold)
--- import qualified Data.Map as Map
 -- import Data.Map (Map)
 -- 
 -- import Control.Monad.Reader
@@ -42,450 +144,173 @@ main = do
 -- import Control.Applicative (Alternative, (<|>), empty, optional, many)
 -- import Debug.Trace
 
-
--- ------------------------------------------------------------
--- -- Terms
--- ------------------------------------------------------------
--- newtype Bind a = Bind a
---     deriving (Eq,Show)
--- 
--- data Term
---     = Rigid RName (Trail (Elim Term))
---     | Flex Name (Trail (Elim Term))
---     | Abs (Bind Term)
---     | Pi Term (Bind Term)
---     | Sigma Term (Bind Term)
---     | Pair Term Term
---     | Star
---     deriving (Eq,Show)
--- 
--- data Elim a = App a | Fst | Snd
---     deriving (Eq,Show)
--- 
--- data RName
---     = Unquoted Int
---     | Closed Int
---     | Bound Name
---     deriving (Eq,Show,Ord)
---  
--- newtype Name = Name Int
---     deriving (Eq,Show,Ord)
---  
--- type Type = Term
--- 
--- instance Functor Elim where
---     fmap f (App a) = App (f a)
---     fmap f Fst = Fst
---     fmap f Snd = Snd
--- 
--- instance Foldable Elim where
---     foldMap f (App a) = (f a)
---     foldMap f Fst = mempty
---     foldMap f Snd = mempty
---  
--- ------------------------------------------------------------
--- -- Evaluator
--- ------------------------------------------------------------
--- data Env = Env {context :: Signature, scope :: [Value]}
--- 
--- data Value
---     = VFlex Name (Trail (Elim Value))
---     | VRigid RName (Trail (Elim Value))
---     | VAbs (Value -> Value)
---     | VPi Value (Value -> Value)
---     | VSigma Value (Value -> Value)
---     | VPair Value Value
---     | VStar
--- 
--- extend :: Value -> Env -> Env
--- extend v env = env { scope = v : scope env }
---  
--- bindEval :: Env -> Bind Term -> (Value -> Value)
--- bindEval env (Bind term) x = eval (extend x env) term
---  
--- eval :: Env -> Term -> Value
--- eval env (Rigid h e) = vsp (rigidEval env h) (fmap (fmap (eval env)) e) 
--- eval env (Flex m e) = vsp (vmeta (context env) m) (fmap (fmap (eval env)) e) 
--- eval env (Abs e) = VAbs (bindEval env e)
--- eval env (Pi a b) = VPi (eval env a) (bindEval env b)
--- eval env (Sigma a b) = VSigma (eval env a) (bindEval env b)
--- eval env (Pair a b) = VPair (eval env a) (eval env b)
--- eval env Star = VStar
--- 
--- rigidEval :: Env -> RName -> Value
--- rigidEval env (Closed i) = scope env !! i
--- rigidEval env name = vpar (context env) name
--- 
--- vsp :: Value -> Trail (Elim Value) -> Value
--- vsp head (xs:<App arg) = vsp head xs `vapp` arg
--- vsp head (xs:<Fst) = vfst (vsp head xs)
--- vsp head (xs:<Snd) = vsnd (vsp head xs)
--- vsp head B0 = head
--- 
--- vapp :: Value -> Value -> Value
--- vapp (VAbs f)       v = f v
--- vapp (VFlex i e)    v = VFlex i (e:<App v)
--- vapp (VRigid n e)   v = VRigid n (e:<App v)
--- vapp _              v = error "runtime type error"
---  
--- vfst :: Value -> Value
--- vfst (VPair a b)    = a
--- vfst (VFlex i e)    = VFlex i (e:<Fst)
--- vfst (VRigid n e)   = VRigid n (e:<Fst)
--- vfst _              = error "runtime type error"
--- 
--- vsnd :: Value -> Value
--- vsnd (VPair a b)    = b
--- vsnd (VFlex i e)    = VFlex i (e:<Snd)
--- vsnd (VRigid n e)   = VRigid n (e:<Snd)
--- vsnd _              = error "runtime type error"
---  
--- vmeta :: Signature -> Name -> Value
--- vmeta ctx i = case Map.lookup i ctx of
---     Just (_, DEFN v) -> eval (Env ctx []) v
---     Just (_, HOLE) -> VFlex i B0
---     Nothing -> VFlex i B0
--- 
--- vpar :: Signature -> RName -> Value
--- -- vpar ctx (Bound i) = case lookup i ctx of
--- --     Just (_, DEFN v) -> v
--- --     Just (_, HOLE) -> VRigid (Bound i) B0
--- --     Nothing -> VRigid (Bound i) B0
--- vpar ctx n = VRigid n B0
--- 
--- vunquoted :: Int -> Value
--- vunquoted i = VRigid (Unquoted i) B0
--- 
--- ------------------------------------------------------------
--- -- Binding
--- ------------------------------------------------------------
--- class Binding t where
---     binding :: Int -> (Int -> RName -> RName) -> t -> t
--- 
--- instance Binding Term where
---     binding i f (Rigid h e) = Rigid (f i h) (fmap (fmap (binding i f)) e)
---     binding i f (Flex m e) = Flex m (fmap (fmap (binding i f)) e)
---     binding i f (Abs e) = Abs (binding i f e)
---     binding i f (Pi t t') = Pi (binding i f t) (binding i f t')
---     binding i f (Sigma t t') = Sigma (binding i f t) (binding i f t')
---     binding i f (Pair a b) = Pair (binding i f a) (binding i f b)
---     binding i f Star = Star
---  
--- instance Binding t => Binding (Bind t) where
---     binding i f (Bind t) = Bind (binding (i+1) f t)
---  
--- bind :: Binding t => Name -> t -> Bind t
--- bind k v = Bind (binding 0 help v)
---     where help :: Int -> RName -> RName
---           help i (Bound k') | (k == k') = (Closed i)
---           --help i (Meta k') | (k == k') = Var (Closed i)
---           help i head = head
--- 
--- unbind :: Binding t => Name -> Bind t -> t
--- unbind name (Bind v) = binding 0 help v
---     where help :: Int -> RName -> RName
---           help i (Closed j) | (i == j) = (Bound name)
---           help i head = head
--- 
--- loosen :: Binding t => t -> t
--- loosen v = binding 0 help v
---     where help :: Int -> RName -> RName
---           help i (Closed j) | (i <= j) = (Closed (j+1))
---           help i head = head
--- 
--- tighten :: Binding t => Int -> t -> t
--- tighten k v = binding k help v
---     where help :: Int -> RName -> RName
---           help i (Closed j) | (i < j) = (Closed (j-1))
---           help i (Closed j) | (i == j) = error "bug, did you use fv?"
---           help i head = head
--- 
--- tighten' :: Binding t => Trail Int -> t -> t
--- tighten' ts v = binding 0 help v
---     where help :: Int -> RName -> RName
---           help i (Closed j) | (i <= j) = Closed (j - sum (take' (j-i) ts))
---           help i head = head
--- 
--- take' :: Int -> Trail a -> [a]
--- take' n B0 = []
--- take' 0 (xs:<x) = []
--- take' n (xs:<x) = x : take' (n-1) xs
--- 
--- raise v k = binding 0 help v
---     where help :: Int -> RName -> RName
---           help i (Closed j) | (i <= j) = (Closed (j+k))
---           help i head = head
--- 
--- -- This alone should be sufficient for flowing values inside metavars.
--- remap :: Term -> Trail Term -> Term
--- remap t xs = abss (binding 0 help t) xs
---     where help :: Int -> RName -> RName
---           help i (Closed j) | (i <= j) = Closed (locate xs (j-i) 0+i)
---           help i head = head
--- 
--- abss :: Term -> Trail Term -> Term
--- abss term B0 = term
--- abss term (xs:<_) = abss (Abs (Bind term)) xs
--- 
--- locate :: Trail Term -> Int -> Int -> Int
--- locate B0 _ _ = error "should have been there"
--- locate (xs:<Rigid (Closed j) B0) i n | (i == j) = n
--- locate (xs:<x) i n = locate xs i (n+1)
--- 
--- -- subst :: Binding t => Head -> Bind t -> t
--- -- subst head (Bind v) = binding 0 help v
--- --     where help :: Int -> Head -> Head
--- --           help i (Var (Closed j)) | (i == j) = head
--- --           help i head = head
--- 
--- -- ------------------------------------------------------------
--- -- -- Value forcing
--- -- ------------------------------------------------------------
--- -- force :: Subs -> Value -> Value
--- -- force ctx (VFlex m sp) = case lookup ( m) ctx of
--- --     Just v -> vsp v sp
--- --     Nothing -> VFlex m sp
--- -- force ctx v = v
---  
--- ------------------------------------------------------------
--- -- Quotation
--- ------------------------------------------------------------
--- quote0 :: Value -> Term
--- quote0 = quote 0
--- 
--- quote :: Int -> Value -> Term
--- quote i (VFlex j e) = Flex j (fmap (fmap (quote i)) e)
--- quote i (VRigid h e) = Rigid (varpar i h) (fmap (fmap (quote i)) e)
--- quote i (VAbs f) = Abs (bindQuote i f)
--- quote i (VPi a f) = Pi (quote i a) (bindQuote i f)
--- quote i (VSigma a f) = Sigma (quote i a) (bindQuote i f)
--- quote i (VPair a b) = Pair (quote i a) (quote i b)
--- quote i VStar = Star
--- 
--- bindQuote i f = Bind (quote (i+1) (f (vunquoted i)))
---  
--- varpar :: Int -> RName -> RName
--- varpar i (Unquoted k) = Closed (i - k - 1)
--- varpar i x            = x
--- 
--- ctxToScope :: Ctx -> [Value]
--- ctxToScope ctx = snd (help ctx)
---     where help :: Ctx -> (Int, [Value])
---           help B0 = (0, [])
---           help (xs:<x) = let (n, ys) = help xs
---                          in (n+1, vunquoted n : ys)
--- 
--- class Nf a where
---     nf :: Env -> a -> a
--- 
--- instance Nf Term where
---     nf env t = quote (length (scope env)) (eval env t)
--- 
--- instance Nf a => Nf (Bind a) where
---     nf env (Bind a) = Bind (nf (extend (vunquoted (length (scope env))) env) a)
--- 
--- instance Nf a => Nf [a] where
---     nf env xs = fmap (nf env) xs
--- 
--- -- Some weirdness
--- -- bonk :: Env
--- -- bonk = Env Map.empty []
--- -- 
--- -- ($$) :: Term -> Term -> Term
--- -- f $$ a = quote0 $ vapp (eval bonk f) (eval bonk a)
--- -- 
--- -- hd :: Term -> Term
--- -- hd a = quote0 $ vfst (eval bonk a)
--- -- 
--- -- tl :: Term -> Term
--- -- tl a = quote0 $ vsnd (eval bonk a)
---  
--- inst :: Env -> Bind Term -> Term -> Term
--- inst env a b = quote (length (scope env)) $
---                  vapp (eval env (Abs a)) (eval env b)
--- -- 
--- -- (%%) :: Term -> Elim Term -> Term
--- -- t %% e = quote0 $ vsp (eval bonk t) (B0:<(fmap (eval bonk) e))
---  
--- -- Rather than definining functions to determine the free metavariables
--- -- and variables of terms directly, I use a typeclass to make them
--- -- available on the whole syntax.
--- data Flavour = Vars | RigVars | Metas
---  
--- class Occurs t where
---     free   :: Flavour -> t -> Set Name
--- 
--- fvs, fvrigs :: Occurs t => t -> Set Name
--- fvs       = free Vars
--- fvrigs    = free RigVars
--- fmvs :: Occurs t => t -> Set Name
--- fmvs      = free Metas
--- 
--- instance Occurs Term where
---     free RigVars  (Rigid (Bound x) e) = singleton x `union` free RigVars e
---     free RigVars  (Flex i _) = Set.empty
---     free Vars       (Flex _ e)      = free Vars e
---     --free RigVars    (Flex _ e)      = free RigVars e
---     free Metas      (Flex alpha e)  = singleton alpha `union` free Metas e
---     free Vars       (Rigid (Bound x) e) = singleton x `union` free Vars e
---     --free RigVars    (Rigid (Bound x) e) = singleton x `union` free RigVars e
---     free Metas      (Rigid (Bound _) e) = Set.empty `union` free Metas e
---     free l          (Rigid _ e)         = Set.empty `union` free l e
---     free l (Abs b) = free l b
---     free l (Pi s t) = free l s `union` free l t
---     free l (Sigma s t) = free l s `union` free l t
---     free l (Pair s t) = free l s `union` free l t
---     free l Star = Set.empty
---  
--- instance (Occurs t, Occurs u, Occurs v) => Occurs (t,u,v) where
---     free l (a,b,c) = unions [free l a, free l b, free l c]
--- 
--- instance Occurs t => Occurs [t] where
---     free l = unions . map (free l)
--- 
--- instance Occurs t => Occurs (Trail t) where
---     free l B0 = Set.empty
---     free l (xs :< x) = free l xs `union` free l x
--- 
--- instance Occurs t => Occurs (Elim t) where
---     free l (App a)       = free l a
---     free l Fst           = Set.empty
---     free l Snd           = Set.empty
--- 
--- instance Occurs a => Occurs (Bind a) where
---     free l (Bind a) = free l a
--- 
--- class Fv a where
---     fv :: a -> Set Int
---     fvr :: a -> Set Int
--- 
--- instance Fv Term where
---     fv (Rigid h e) = fv h `union` fv e
---     fv (Flex _ e) = fv e
---     fv (Abs b) = fv b
---     fv (Pi s t) = fv s `union` fv t
---     fv (Sigma s t) = fv s `union` fv t
---     fv (Pair s t) = fv s `union` fv t
---     fv Star = Set.empty
--- 
---     fvr (Rigid h e) = fvr h `union` fvr e
---     fvr (Flex _ e) = Set.empty
---     fvr (Abs b) = fvr b
---     fvr (Pi s t) = fvr s `union` fvr t
---     fvr (Sigma s t) = fvr s `union` fvr t
---     fvr (Pair s t) = fvr s `union` fvr t
---     fvr Star = Set.empty
--- 
--- instance Fv RName where
---     fv (Closed i) = singleton i
---     fv _ = Set.empty
--- 
---     fvr (Closed i) = singleton i
---     fvr _ = Set.empty
--- 
--- instance Fv a => Fv (Trail a) where
---     fv B0 = Set.empty
---     fv (xs:<x) = fv xs `union` fv x
---     fvr B0 = Set.empty
---     fvr (xs:<x) = fvr xs `union` fvr x
--- 
--- instance Fv a => Fv (Elim a) where
---     fv (App a) = fv a
---     fv Fst     = Set.empty
---     fv Snd     = Set.empty
---     fvr (App a) = fvr a
---     fvr Fst     = Set.empty
---     fvr Snd     = Set.empty
--- 
--- instance Fv a => Fv (Bind a) where
---     fv (Bind a) = (-1) `Set.delete` Set.map (\x -> x-1) (fv a)
---     fvr (Bind a) = (-1) `Set.delete` Set.map (\x -> x-1) (fvr a)
--- 
--- 
--- data Decl v    = HOLE | DEFN v
---     deriving (Eq, Show)
--- type Entry = (Type, Decl Term)
--- type Signature = Map Name Entry
--- 
--- -- Metavariables in the signature
--- --support (xs:<_) = support xs
--- 
--- -- I don't have atom decls, for now, but they would go here.
--- -- atomDecls :: Signature -> Set Name
--- -- atomDecls B0 = Set.empty
--- -- atomDecls (xs:<SA name _) = Set.insert name (atomDecls xs)
--- -- atomDecls (xs:<_) = atomDecls xs
--- 
--- -- decls :: Signature -> Set Name
--- -- decls xs = support xs `union` atomDecls xs
--- 
--- metas :: Occurs t => t -> Set Name
--- metas = fmvs
--- 
--- -- atoms :: Occurs t => t -> Set Name
--- -- atoms = fvs -- I'm not certain these are atoms.
--- 
--- -- consts :: Occurs t => t -> Set Name
--- -- consts t = metas t `union` atoms t
--- 
--- type Ctx = Trail Type
--- 
--- data Constraint = C Ctx Ctx Term Term Type Type
---     deriving (Eq,Show)
--- 
--- data Solver = Solver {
---     signature :: Signature,
---     constraints :: [(Status, Constraint)],
---     nextVar   :: Int }
---     deriving (Eq,Show)
--- 
 -- emptySolver :: Int -> Solver
 -- emptySolver = Solver (Map.empty) []
--- 
--- data Status = Active | Blocked
---     deriving (Eq,Show)
--- 
--- type Context a
---     = ReaderT Ctx (StateT Solver (ExceptT String Identity)) a
--- 
--- fresh :: MonadState Solver m => m Name
--- fresh = do
---     n <- Name <$> gets nextVar
---     modify (\ctx -> ctx { nextVar = nextVar ctx + 1 })
---     pure n
--- 
--- support :: MonadState Solver m => m (Set Name)
--- support = help <$> gets signature
---     where help :: Signature -> Set Name
---           help sig = Set.fromList (Map.keys sig)
--- 
--- runContext :: Ctx -> Solver -> Context a -> Either String (a, Solver)
--- runContext ctx solver m =
---     runIdentity (runExceptT (runStateT (runReaderT m ctx) solver))
--- 
--- index :: Trail a -> Int -> a
--- index B0 i = error "overshoot"
--- index (xs:<x) 0 = x
--- index (xs:<x) n = index xs (n-1)
--- 
--- eq :: (MonadState Solver m, MonadReader Ctx m) => Term -> Type
---                                                -> Term -> Type -> m ()
--- eq s _S t _T = do
+
+evalAdjust :: Int -> ((Term -> Value) -> Value) -> Type
+evalAdjust depth f =
+    let env = vunquoteds depth
+        ns = Ns Map.empty Map.empty False
+    in quote depth (f (eval ns env))
+
+raise :: Type -> Int -> Int -> (Value -> Value) -> Type
+raise ty i depth f =
+    let env = vunquoteds depth
+        ns = Ns Map.empty Map.empty False
+    in quote (depth+i) (f (eval ns env ty))
+
+lookupVar :: Ctx -> Int -> Type
+lookupVar ctx i = raise (ctx !!! i) (i+1) (length ctx-i-1) id
+
+type Mapping = Ctx -> String -> Term -> Type -> Context ()
+
+baseMapping :: Ctx -> String -> Term -> Type -> Context ()
+baseMapping ctx name t ty = do
+    types <- gets S.types
+    case Map.lookup name types of
+        Just ty' -> do
+            eq ctx (Rigid (Const name) B0) ty'
+                   t ty
+        Nothing -> 
+            eq ctx (Rigid (Const name) B0) (Rigid (Unavailable name) B0)
+                   t ty
+
+elaborate :: Ctx -> Mapping -> STerm -> Type -> Context Term
+elaborate ctx m t ty = do
+    a0 <- fresh (fromTelescope ctx ty)
+    let u = Flex a0 (vector 0 (length ctx))
+    case t of
+        SName name -> m ctx name u ty >> pure u
+        SCall a r b -> do
+            y0 <- fresh (fromTelescope ctx Star)
+            let _Y0 = Flex y0 (vector 0 (length ctx))
+            y1 <- fresh (fromTelescope (ctx:<_Y0) Star)
+            let _Y1 = Flex y1 (vector 0 (length ctx+1))
+            y2 <- fresh (fromTelescope (ctx:<_Y0:<_Y1) Star)
+            let _Y2 = Flex y2 (vector 0 (length ctx+2))
+            a' <- elaborate ctx m a (Pi _Y0 (Pi _Y1 _Y2))
+            q <- elaborateRecord ctx m r _Y0
+            v <- elaborate ctx m b (Flex y1 (vector 0 (length ctx):<App q))
+            let ty' = (Flex y2 (vector 0 (length ctx):<App q:<App v))
+            let p = evalAdjust (length ctx) (\ev -> ev a' `vapp` ev q `vapp` ev v)
+            eq ctx u ty p ty'
+            pure u
+-- inferElim (App x) (f, e, ty) = do
 --     ctx <- ask
---     let c = C ctx ctx s t _S _T
---     modify (\ctx -> ctx { constraints = (Active, c) : constraints ctx })
---     let c' = C ctx ctx _S _T Star Star
---     modify (\ctx -> ctx { constraints = (Active, c') : constraints ctx })
--- 
--- lookupVar :: (MonadState Solver m) => Ctx -> RName -> m Type
--- lookupVar ctx (Closed i) = pure (raise (ctx `index` i) (i+1))
--- 
--- addSignature :: (MonadState Solver m) => Name -> Entry -> m ()
--- addSignature name se = modify (\sol -> sol { signature = Map.insert name se (signature sol) })
--- 
--- expand :: (MonadReader Ctx m) => Type -> m a -> m a
--- expand ty m = local (:<ty) m
--- 
+--     y1 <- fresh
+--     y2 <- fresh
+--     let _Y1 = (Flex y1 (vector 0 ctx))
+--     let _Y2 = (Flex y2 (vector 0 (ctx:<_Y1)))
+--     addSignature y1 (fromTelescope ctx Star, HOLE)
+--     addSignature y2 (fromTelescope (ctx:<_Y1) Star, HOLE)
+--     u <- elaborate x _Y1
+--     eq ty Star (Pi _Y1 (Bind _Y2)) Star
+--     pure (f, e:<App u, Flex y2 (vector 0 ctx:<App u))
+
+        SAbs r n body -> do
+            case ty of
+                Pi (RecordType rec) (Pi a b) | length r <= length rec -> do
+                    let ctx' = ctx:<RecordType rec:<a
+                    let rec' = zip r (map snd rec)
+                    let m' = mappingRecord (length ctx) 0 rec' m
+                    let m'' = mappingVar (length ctx+1) n m'
+                    body <- elaborate ctx' m'' body b
+                    eq ctx u ty (Abs (Abs body)) ty
+                    pure u
+                _ -> error $ "TODO " ++ show ty
+--         Abs (Bind body) -> do
+--             y1 <- fresh
+--             y2 <- fresh
+--             let _Y1 = (Flex y1 (vector 0 ctx))
+--             let _Y2 = (Flex y2 (vector 0 (ctx:<_Y1)))
+--             addSignature y1 (fromTelescope ctx Star, HOLE)
+--             addSignature y2 (fromTelescope (ctx:<_Y1) Star, HOLE)
+--             u' <- expand _Y1 (elaborate body _Y2)
+--             eq u ty (Abs (Bind u')) (Pi _Y1 (Bind _Y2))
+        SPi r n a b -> do
+            rec <- elaborateRecordType ctx m 0 r
+            let ctx' = ctx:<RecordType rec
+            let m' = mappingRecord (length ctx) 0 rec m
+            s <- elaborate ctx' m' a Star
+            let ctx'' = ctx':<s
+            let m'' = mappingVar (length ctx') n m'
+            t <- elaborate ctx'' m'' b Star
+            eq ctx u ty (Pi (RecordType rec) (Pi s t)) Star
+            pure u
+        SAnn a b -> error "TODO"
+        SHole -> pure u
+        SStar -> eq ctx u ty Star Star >> pure u
+        SEq a x y -> error "TODO"
+        SIntegerConst i -> error "TODO"
+        SRealConst r -> error "TODO"
+        SStringConst s -> error "TODO"
+        SBind n a b -> error "TODO"
+        SField a n -> error "TODO"
+        SCase x mot cases -> error "TODO"
+        SCocase cases -> error "TODO"
+        SORecord terms -> error "TODO"
+        SLRecord lterms ext -> error "TODO"
+
+elaborateRecord :: Ctx -> Mapping -> [(String, STerm)] -> Type -> Context Term
+elaborateRecord ctx m xs ty = do
+    a0 <- fresh (fromTelescope ctx ty)
+    let u = Flex a0 (vector 0 (length ctx))
+    active (D "record" (elaborateRecord' m xs u) ctx ty)
+    pure u
+
+elaborateRecord' :: Mapping -> [(String, STerm)] -> Term -> Ctx -> Type -> Context ()
+elaborateRecord' m xs t ctx (RecordType rec) = do
+    mapM_ (\(name, val) -> case lookup name rec of
+        Just a -> pure ()
+        Nothing -> error $ show name <> " not part of record") xs
+    r <- elaborateFields ctx m B0 xs rec
+    eq ctx t (RecordType rec) (Record r) (RecordType rec)
+elaborateRecord' m xs t ctx ty = do
+    block (D "record" (elaborateRecord' m xs t) ctx ty)
+
+elaborateFields :: Ctx -> Mapping -> Elims Term -> [(String, STerm)] -> [(String, Type)] -> Context [Term]
+elaborateFields ctx m el xs [] = pure []
+elaborateFields ctx m el xs ((name,ty):rec) = do
+    let ty' = evalAdjust (length ctx) (\e -> vsp (e ty) (fmap (fmap e) el))
+    t <- case lookup name xs of
+        Just sterm -> elaborate ctx m sterm ty'
+        Nothing -> do
+            a0 <- fresh (fromTelescope ctx ty')
+            pure (Flex a0 (vector 0 (length ctx) <.> el))
+    (t:) <$> elaborateFields ctx m (el:<App t) xs rec
+
+elaborateRecordType :: Ctx -> Mapping -> Int -> [(String, STerm)]
+                    -> Context [(String, Term)]
+elaborateRecordType ctx m i [] = pure []
+elaborateRecordType ctx m i ((name,term):terms) = do
+    u <- elaborate ctx m term Star
+    let entry = (name,wrapAbs i u)
+    let ctx' = ctx:<u
+    let m' = mappingVar (length ctx) name m
+    r <- elaborateRecordType ctx' m' (i+1) terms
+    pure (entry:r)
+
+mappingRecord :: Int -> Int -> [(String, Type)] -> Mapping -> Mapping
+mappingRecord i j [] m = m
+mappingRecord i j ((name,ty):xs) m =
+    mappingRecord i (j+1) xs m' 
+    where m' :: Mapping
+          m' ctx name' term' ty' | name == name' = do
+              let k = (length ctx - i - 1)
+              let ty'' = raise ty (k+1) (length ctx-k-1) (rig k j)
+              eq ctx (Rigid (Closed k) (B0:<Field j)) ty'' term' ty'
+          m' ctx name' term' ty' = m ctx name' term' ty'
+          rig :: Int -> Int -> Value -> Value
+          rig k 0 v = v
+          rig k j v = rig k (j-1) v `vapp` VRigid (Unquoted i) (B0:<Field (j-1))
+
+mappingVar :: Int -> String -> Mapping -> Mapping
+mappingVar i name m ctx name' term ty | name == name' = do
+    let k = (length ctx - i - 1)
+    let ty' = lookupVar ctx k
+    eq ctx (Rigid (Closed k) B0) ty' term ty
+mappingVar i name m ctx name' term ty = m ctx name' term ty
+
 -- elaborate :: Term -> Type -> Context Term
 -- elaborate t ty = do
 --     a0 <- fresh
@@ -499,19 +324,6 @@ main = do
 --         Flex alpha elim -> do
 --             (f, elim, ty') <- inferMeta alpha >>= inferElims elim
 --             eq u ty (f elim) ty'
---         Abs (Bind body) -> do
---             y1 <- fresh
---             y2 <- fresh
---             let _Y1 = (Flex y1 (vector 0 ctx))
---             let _Y2 = (Flex y2 (vector 0 (ctx:<_Y1)))
---             addSignature y1 (fromTelescope ctx Star, HOLE)
---             addSignature y2 (fromTelescope (ctx:<_Y1) Star, HOLE)
---             u' <- expand _Y1 (elaborate body _Y2)
---             eq u ty (Abs (Bind u')) (Pi _Y1 (Bind _Y2))
---         Pi a (Bind b) -> do
---             s <- elaborate a Star
---             t <- expand s (elaborate b Star)
---             eq u ty (Pi s (Bind t)) Star
 --         Sigma a (Bind b) -> do
 --             s <- elaborate a Star
 --             t <- expand s (elaborate b Star)
@@ -526,7 +338,6 @@ main = do
 --             s <- elaborate a _Y1
 --             t <- elaborate b (Flex y2 (vector 0 ctx:<App s))
 --             eq u ty (Pair s t) (Sigma _Y1 (Bind _Y2))
---         Star -> eq u Star Star Star
 --     pure u
 -- 
 -- type HeadTrail = (Trail (Elim Term) -> Term, Trail (Elim Term), Type)
@@ -554,17 +365,6 @@ main = do
 -- inferElims (xs:<x) ht = inferElims xs ht >>= inferElim x
 -- 
 -- inferElim :: Elim Term -> HeadTrail -> Context HeadTrail
--- inferElim (App x) (f, e, ty) = do
---     ctx <- ask
---     y1 <- fresh
---     y2 <- fresh
---     let _Y1 = (Flex y1 (vector 0 ctx))
---     let _Y2 = (Flex y2 (vector 0 (ctx:<_Y1)))
---     addSignature y1 (fromTelescope ctx Star, HOLE)
---     addSignature y2 (fromTelescope (ctx:<_Y1) Star, HOLE)
---     u <- elaborate x _Y1
---     eq ty Star (Pi _Y1 (Bind _Y2)) Star
---     pure (f, e:<App u, Flex y2 (vector 0 ctx:<App u))
 -- inferElim Fst (f, e, ty) = do
 --     ctx <- ask
 --     y1 <- fresh
@@ -586,60 +386,9 @@ main = do
 --     eq ty Star (Sigma _Y1 (Bind _Y2)) Star
 --     pure (f, e:<Snd, Flex y2 (vector 0 ctx:<App (f (e:<Fst))))
 -- 
--- fromTelescope :: Trail Type -> Type -> Type
--- fromTelescope xs t = foldr (\x y -> Pi x (Bind y)) t xs
--- --fromTelescope B0 t = t
--- --fromTelescope (xs:<x) t = fromTelescope xs (Pi x (Bind t))
--- 
--- telescope :: Type -> (Trail Type, Type)
--- telescope t = telescope' B0 t
---     where telescope' :: Trail Type -> Type -> (Trail Type, Type)
---           telescope' xs (Pi a (Bind b)) = telescope' (xs :< a) b
---           telescope' xs a = (xs, a)
--- 
 -- vector :: Int -> Trail a -> Trail (Elim Term)
 -- vector i B0 = B0 
 -- vector i (xs:<x) = vector (i+1) xs :< App (Rigid (Closed  i) B0)
--- 
--- hole :: Ctx -> Type -> Solving Name
--- hole _Gam _T = do
---     alpha <- fresh
---     sol <- get
---     put sol { signature = Map.insert alpha (fromTelescope _Gam _T, HOLE)
---                           (signature sol) }
---     pure alpha
--- 
--- define :: Ctx -> Name -> Type -> Term -> Solving ()
--- define _Gam alpha _S v = do
---     sol <- get
---     put sol { signature = Map.insert alpha
---                           (fromTelescope _Gam _S, DEFN (abss v _Gam))
---                           (signature sol) }
--- 
--- normalize :: Signature -> Constraint -> Constraint
--- normalize sig (C ctx ctx' t t' ty ty') = C
---     (nfContext sig ctx)
---     (nfContext sig ctx')
---     (nf (Env sig (ctxToScope ctx)) t)
---     (nf (Env sig (ctxToScope ctx')) t')
---     (nf (Env sig (ctxToScope ctx)) ty)
---     (nf (Env sig (ctxToScope ctx')) ty')
--- 
--- nfContext :: Signature -> Ctx -> Ctx
--- nfContext sig B0 = B0
--- nfContext sig (xs:<x) = let xs' = nfContext sig xs
---                         in xs':<nf (Env sig (ctxToScope xs')) x
--- 
--- postpone :: Status -> Constraint -> Solving ()
--- postpone status constraint = do
---   --trace (show (status, constraint)) $
---     modify (\sol -> sol { constraints = (status, constraint) : constraints sol })
--- 
--- active :: Constraint -> Solving ()
--- active = postpone Active
--- 
--- block :: Constraint -> Solving ()
--- block = postpone Blocked
 -- 
 -- id_ty :: Term
 -- id_ty = Pi Star (Bind (Pi (Rigid (Closed 0) B0) (Bind (Rigid (Closed 1) B0))))
@@ -744,365 +493,3 @@ main = do
 --                 Left error -> putStrLn ("error: " ++ error)
 --                 Right (term, solver) -> do
 --                     putStrLn ("success: " ++ show term)
--- 
--- solve :: Solver -> Solver
--- solve solver = case runIdentity (runStateT (runMaybeT solveSteps) solver) of
---                (Nothing, solver') -> solver'
---                (Just (), solver') -> solve solver'
--- 
--- type Solving a = MaybeT (StateT Solver Identity) a
--- 
--- solveSteps :: Solving ()
--- solveSteps = do
---     sol <- get
---     let cons = constraints sol
---     put sol { constraints = [] }
---     progress <- solveConstraints cons
---     guard progress <|> (gets signature >>= lowering . Map.toList >>= guard)
---     
---     -- <|> TODO: unblockConstraints by eta-expanding
---     -- uninstantiated metavariables
--- 
--- solveConstraints :: [(Status, Constraint)] -> Solving Bool
--- solveConstraints [] = pure False
--- solveConstraints ((a,x):xs) = do
---     progress <- solveConstraints xs
---     sig <- gets signature
---     let x' = normalize sig x
---     if isActive a || (x' /= x) then do
---         optional (refine x')
---         pure True
---     else do
---         block x
---         pure progress
--- 
--- isActive :: Status -> Bool
--- isActive Active = True
--- isActive Blocked = False
--- 
--- (<||) :: Monad m => m Bool -> m () -> m ()
--- a <|| b = do x <- a
---              unless x b
--- 
--- infixr 5 <||
--- 
--- sym :: Constraint -> Constraint
--- sym (C ctx ctx' t t' ty ty') = C ctx' ctx t' t ty' ty
--- 
--- refine :: Constraint -> Solving ()
--- refine (C ctx1 ctx2 t1 t2 ty1 ty2) | (t1 == t2) = pure ()
--- refine (C ctx1 ctx2 t1 t2 ty1 ty2) = do
---         sig <- gets signature
---         --trace ("refine " ++ (show (C ctx1 ctx2 t1 t2 ty1 ty2))) $
---         --  pure ()
---         -- The if case of Definition 2.158 (strongly neutral term) has a
---         -- condition on the number of argumetns which may be fullfilled
---         -- by n-expanding the terms.
---         let t1'' = etaExpandDefHeaded t1
---         let t2'' = etaExpandDefHeaded t2
---         case (t1'', t2'') of
---             (Rigid a e1, Rigid b e2) -> do -- by rule schema 14 (strongly neutral term)
---                 optional (matchSpine ctx1 a e1 ctx2 b e2)
---                 block (C ctx1 ctx2 t1'' t2'' ty1 ty2)
---             (Flex a e1, Flex b e2) | a == b -> do
---                 flexFlexSame ctx1 ctx2 a e1 e2 ty1 ty2
---             (Flex a e1, Flex b e2) -> do
---                 let t1''' = etaContractWhnf t1''
---                 let t2''' = etaContractWhnf t2''
---                 let q = (C ctx1 ctx2 t1''' t2''' ty1 ty2)
---                 tryPrune q <|| tryPrune (sym q) <|| tryInvert q <|| tryInvert (sym q) <|| block q
---             (Flex a e1, u) -> do
---                 let t1''' = etaContractWhnf t1''
---                 let t2''' = etaContractWhnf t2''
---                 let q = (C ctx1 ctx2 t1''' t2''' ty1 ty2)
---                 tryPrune q <|| tryInvert q <|| block q
---             (u, Flex b e2) -> do
---                 let t1''' = etaContractWhnf t1''
---                 let t2''' = etaContractWhnf t2''
---                 let q = (C ctx2 ctx1 t2''' t1''' ty2 ty1)
---                 tryPrune q <|| tryInvert q <|| block q
---             (_, _) -> do
---                 (t1''', ty1') <- etaExpand ctx1 t1'' (nf (Env sig (ctxToScope ctx1)) ty1)
---                 (t2''', ty2') <- etaExpand ctx2 t2'' (nf (Env sig (ctxToScope ctx2)) ty2)
---                 splitDown ctx1 ctx2 t1''' t2''' ty1' ty2'
---                 -- by rule schema 11 (λ-abstraction)
---                 -- by rule schema 12 (pairs)
---                 -- by rule schema 13 (booleans)
---                 -- by rule schema 3 (injectivity of ∏)
---                 -- by rule schema 4 (injectivity of Σ)
---                 -- by rule schema 5 (bool)
---                 -- by rule schema 6 set
---                 --pure [(Never, C ctx1 ctx2 t1''' t2''' ty1' ty2')]
--- 
--- splitDown :: Ctx -> Ctx -> Term -> Term -> Type -> Type -> Solving ()
--- splitDown ctx ctx' (Pi a (Bind b)) (Pi a' (Bind b')) Star Star = do
---     let c1 = C ctx ctx' a a' Star Star
---     let c2 = C (ctx:<a) (ctx':<a') b b' Star Star
---     active c1
---     active c2
--- splitDown ctx1 ctx2 s t _S _T = block (C ctx1 ctx2 s t _S _T)
--- 
--- tryInvert :: Constraint -> Solving Bool
--- tryInvert (C ctx1 ctx2 (Flex alpha e1) t2 ty1 ty2) = do
---     ty <- getType alpha
---     m <- invert alpha ty e1 t2
---     case m of
---         Nothing ->
---             pure False
---         Just t2' -> do
---             active (C ctx1 ctx2 (Flex alpha e1) t2 ty1 ty2)
---             define B0 alpha ty t2'
---             pure True
--- 
--- invert :: Name -> Type -> Trail (Elim Term) -> Term -> Solving (Maybe Term)
--- invert alpha _T e t | alpha `Set.notMember` fmvs t,
---                       Just xs <- varList e,
---                       fv t `Set.isSubsetOf` fvd xs = do
---                           pure (Just (remap t xs))
---                     | otherwise = pure Nothing
--- 
--- fvd :: Trail Term -> Set Int
--- fvd B0 = Set.empty
--- fvd (xs:<x) = (fvd xs `Set.difference` fv x) `Set.union` (fv x `Set.difference` fvd xs)
--- 
--- getType :: Name -> Solving Type
--- getType name = do
---     sig <- gets signature
---     case Map.lookup name sig of
---         Just (ty,_) -> pure ty
---         Nothing -> error "variable not installed"
--- 
--- tryPrune :: Constraint -> Solving Bool
--- tryPrune q@(C _ _ (Flex alpha e) t _ _) = do
---     u <- pruneTerm (fv e) t
---     case u of
---         (d:_) ->
---             --instantiate d
---             --sig <- gets signature
---             --let q' = normalize sig q
---             --trace "pruned" (active q')
---             --pure True
---             active q >> instantiate d >> pure True
---         [] -> pure False
--- 
--- pruneTerm :: Set Int -> Term -> Solving [Instantiation]
--- pruneTerm vs (Pi s t) = (++) <$> pruneTerm vs s <*> pruneUnder vs t
--- pruneTerm vs (Sigma s t) = (++) <$> pruneTerm vs s <*> pruneUnder vs t
--- pruneTerm vs (Pair s t) = (++) <$> pruneTerm vs s <*> pruneTerm vs t
--- pruneTerm vs (Abs b) = pruneUnder vs b
--- pruneTerm vs Star = pure []
--- pruneTerm vs (Rigid r e) = pruneElims vs e
--- pruneTerm vs (Flex beta e) = pruneMeta vs beta e
--- 
--- pruneUnder :: Set Int -> Bind Term -> Solving [Instantiation]
--- pruneUnder vs (Bind term) = pruneTerm (Set.insert 0 (Set.map (+1) vs)) term
--- 
--- pruneElims :: Set Int -> Trail (Elim Term) -> Solving [Instantiation]
--- pruneElims vs e = fold <$> traverse pruneElim e
---     where pruneElim :: Elim Term -> Solving [Instantiation]
---           pruneElim (App x) = pruneTerm vs x
---           pruneElim Fst = pure []
---           pruneElim Snd = pure []
--- 
--- pruneMeta :: Set Int -> Name -> Trail (Elim Term) -> Solving [Instantiation]
--- pruneMeta vs alpha e = do
---     (tel, ty) <- telescope <$> getType alpha
---     case pruneVars vs (fv ty) tel e of
---         Just dropList | any (/=0) dropList -> do
---             let ty' = tighten' dropList ty
---             let tel' = tightenCtx dropList tel
---             pure [(alpha, fromTelescope tel' ty',
---                   \beta -> abss (Flex beta (revec dropList (vector 0 tel))) tel)]
---         _ -> pure []
--- 
--- tightenCtx :: Trail Int -> Ctx -> Ctx
--- tightenCtx _ B0 = B0
--- tightenCtx (ts:<_) (xs:<x) = tightenCtx ts xs :< tighten' ts x
--- 
--- revec :: Trail Int -> Trail (Elim Term) -> Trail (Elim Term)
--- revec _ B0 = B0
--- revec (ts:<0) (xs:<x) = revec ts xs :< x
--- revec (ts:<_) (xs:<x) = revec ts xs
--- 
--- pruneVars :: Set Int -> Set Int -> Ctx -> Trail (Elim Term) -> Maybe (Trail Int)
--- pruneVars vs ks B0 B0 = Just B0
--- pruneVars vs ks (xs :< _S) (e :< App s) =
---     if 0 `member` ks
---     then do dropList <- pruneVars vs (Set.map (subtract 1) ks `union` fv _S) xs e
---             Just (dropList :< 0)
---     else case toVar s of
---         Just y | y `member` vs -> do
---             dropList <- pruneVars vs (Set.map (subtract 1) ks `union` fv _S) xs e
---             Just (dropList :< 0)
---         _      | not (fvr s `Set.isSubsetOf` vs) -> do
---             dropList <- pruneVars vs (Set.map (subtract 1) ks) xs e
---             Just (dropList :< 1)
---                | otherwise -> Nothing
--- pruneVars vs ks _ _ = Nothing
--- 
--- -- Similar to prune, so it's down here
--- flexFlexSame :: Ctx -> Ctx -> Name
---              -> Trail (Elim Term) -> Trail (Elim Term)
---              -> Type -> Type -> Solving ()
--- flexFlexSame ctx ctx' alpha e e' ty ty' = do
---     (tel, _T) <- telescope <$> getType alpha
---     case intersect (fv _T) tel e e' of
---         Just dropList | any (/=0) dropList -> let _T' = tighten' dropList _T
---                                                   tel' = tightenCtx dropList tel
---                                               in instantiate (alpha, fromTelescope tel' _T',
---                                                               \beta -> abss (Flex beta (revec dropList (vector 0 tel))) tel)
---         _                                  -> block (C ctx ctx' (Flex alpha e) (Flex alpha e') ty ty')
--- 
--- -- Given a telescope and the two evaluation contexts, |intersect|
--- -- checks the evaluation contexts are lists of variables and produces the
--- -- telescope on which they agree.
---  
--- intersect :: Set Int -> Trail Type -> Trail (Elim Term) -> Trail (Elim Term) -> Maybe (Trail Int)
--- intersect ks B0 B0 B0 = pure B0
--- intersect ks (tel :< _S) (e :< App s) (e' :< App s') = do
---     x <- toVar s
---     y <- toVar s'
---     if x == y then do
---         tel <- intersect (Set.map (subtract 1) ks `union` fv _S) tel e e'
---         pure (tel :< 0)
---     else if 0 `member` ks then empty
---          else do tel <- intersect (Set.map (subtract 1) ks) tel e e'
---                  pure (tel :< 1)
---         
--- -- For rigid-rigid interaction.
--- matchSpine :: Ctx -> RName -> Trail (Elim Term)
---            -> Ctx -> RName -> Trail (Elim Term)
---            -> Solving (Type, Type)
--- matchSpine ctx x B0 ctx' x' B0
---     | x == x' = do
---         a <- lookupVar ctx x
---         b <- lookupVar ctx' x'
---         pure (a, b)
---     | otherwise = empty
--- matchSpine ctx x (e :< App a) ctx' x' (e' :< App a') = do
---     (Pi _A _B, Pi _S _T) <- matchSpine ctx x e ctx' x' e'
---     active $ C ctx ctx' a a' _A _S
---     pure (inst (Env Map.empty (ctxToScope ctx)) _B a,
---           inst (Env Map.empty (ctxToScope ctx')) _T a')
--- matchSpine ctx x (e :< Fst) ctx' x' (e' :< Fst) = do
---     (Sigma _A _B, Sigma _S _T) <- matchSpine ctx x e ctx' x' e'
---     pure (_A, _S)
--- matchSpine ctx x (e :< Snd) ctx' x' (e' :< Snd) = do
---     (Sigma _A _B, Sigma _S _T) <- matchSpine ctx x e ctx' x' e'
---     pure (inst (Env Map.empty (ctxToScope ctx))  _B (Rigid x (e :< Fst)),
---           inst (Env Map.empty (ctxToScope ctx')) _T (Rigid x' (e' :< Fst)))
--- matchSpine _ _ _ _ _ _ = empty
--- 
--- lowering :: [(Name, Entry)] -> Solving Bool
--- lowering [] = pure False
--- lowering ((alpha,(ty,HOLE)):xs) = do
---     status <- lowering xs
---     status' <- lower B0 alpha ty
---     pure (status || status')
--- lowering (_:xs) = lowering xs
--- 
--- -- Given the name and type of a metavariable, |lower| attempts to
--- -- simplify it by removing $\Sigma$-types, according to the metavariable
--- -- simplification steps \eqref{eqn:miller:metasimp:sigma} and
--- -- \eqref{eqn:miller:metasimp:pi-sigma} in
--- -- Figure~\longref{fig:miller:solve}, as described in
--- -- Subsection~\longref{subsec:miller:spec:metasimp}.
--- 
--- lower :: Ctx -> Name -> Type -> Solving Bool
--- lower phi alpha (Sigma _S _T) = do
---     beta <- hole phi _S
---     let betaTerm = Flex beta (vector 0 phi)
---     ceta <- hole phi (inst (Env Map.empty (ctxToScope phi)) _T betaTerm)
---     let cetaTerm = Flex ceta (vector 0 phi)
---     define phi alpha (Sigma _S _T) (Pair betaTerm cetaTerm)
---     pure True
--- lower phi alpha (Pi _S (Bind _T)) = lower (phi :< _S) alpha _T
--- lower _ _ _ = pure False
--- 
--- -- > lower :: Telescope -> Nom -> Type -> Contextual Bool
--- -- > lower _Phi alpha (Sig _S _T) =  hole _Phi _S $ \ s ->
--- -- >                                 hole _Phi (inst _T s) $ \ t ->
--- -- >                                 define _Phi alpha (Sig _S _T) (PAIR s t) >>
--- -- >                                 return True
--- -- >
--- -- > lower _Phi alpha (Pi _S _T) = do  x <- fresh (s2n "x")
--- -- >                                   splitSig B0 x _S >>= maybe
--- -- >                                       (lower (_Phi :< (x, _S)) alpha (inst _T (var x)))
--- -- >                                       (\ (y, _A, z, _B, s, (u, v)) ->
--- -- >                                           hole _Phi (_Pi y _A  (_Pi z _B (inst _T s))) $ \ w ->
--- -- >                                           define _Phi alpha (Pi _S _T) (lam x (w $$ u $$ v)) >>
--- -- >                                           return True)      
--- -- >             
--- -- > lower _Phi alpha _T = return False
--- -- 
--- -- Lowering a metavariable needs to split $\Sigma$-types (possibly
--- -- underneath a bunch of parameters) into their components.  For example,
--- -- $[[y : Pi x : X . Sigma z : S . T]]$ splits into
--- -- $[[y0 : Pi x : X . S]]$ and $[[y1 : Pi x : X . {y0 x/z} T]]$.  Given
--- -- the name of a variable and its type, |splitSig| attempts to split it,
--- -- returning fresh variables for the two components of the $\Sigma$-type,
--- -- an inhabitant of the original type in terms of the new variables and
--- -- inhabitants of the new types by projecting the original variable.
--- -- 
--- -- > splitSig ::  Telescope -> Nom -> Type ->
--- -- >                  Contextual (Maybe  (Nom, Type, Nom, Type, Tm, (Tm, Tm)))
--- -- > splitSig _Phi x (Sig _S _T)  = do  y  <- fresh (s2n "y")
--- -- >                                    z  <- fresh (s2n "z")
--- -- >                                    return $ Just  (y, _Pis _Phi _S, z, _Pis _Phi (inst _T (var y $*$ _Phi)),
--- -- >                                                   lams' _Phi (PAIR (var y $*$ _Phi) (var z $*$ _Phi)),
--- -- >                                                   (lams' _Phi (var x $*$ _Phi %% Hd), 
--- -- >                                                        lams' _Phi (var x $*$ _Phi %% Tl)))
--- -- > splitSig _Phi x (Pi _A _B)   = do  a <- fresh (s2n "a")
--- -- >                                    splitSig (_Phi :< (a, _A)) x (inst _B (var a))
--- -- > splitSig _ _ _ = return Nothing
--- 
--- type Instantiation = (Name, Type, Name -> Term)
--- 
--- instantiate :: Instantiation -> Solving ()
--- instantiate d@(alpha, ty, f) = do
---     beta <- hole B0 ty
---     ty' <- getType alpha
---     define B0 alpha ty' (f beta)
---     
--- 
--- tZip :: Trail a -> Trail b -> Trail (a, b)
--- tZip B0 _ = B0
--- tZip _ B0 = B0
--- tZip (xs:<x) (ys:<y) = tZip xs ys :< (x, y)
--- 
--- size :: Trail a -> Int
--- size B0 = 0
--- size (xs:<_) = size xs + 1
--- 
--- toVar :: Term -> Maybe Int
--- toVar (Rigid (Closed n) B0) = Just n
--- toVar _ = Nothing
--- 
--- varList :: Alternative m => Trail (Elim (Term)) -> m (Trail Term)
--- varList (xs:<App (Flex a B0)) = (:<Flex a B0) <$> varList xs
--- varList (xs:<App (Rigid n B0)) = (:<Rigid n B0) <$> varList xs
--- varList B0 = pure B0
--- varList _ = empty
--- 
--- 
--- etaContractWhnf :: Term -> Term
--- etaContractWhnf t = t
--- --etaContractWhnf (Abs (Bind (VRigid head (elems:<App (VRigid (Closed 0) B0)))))
--- --    | not (0 `Set.member` fv (head, elems)) = 
--- 
--- etaExpand :: Ctx -> Term -> Type -> Solving (Term, Type)
--- etaExpand ctx (Abs x) (Pi a b) = pure (Abs x, Pi a b)
--- etaExpand ctx (Pair x y) (Sigma a b) = pure (Pair x y, Sigma a b)
--- etaExpand ctx f (Pi a b) = pure (Abs (Bind expr), Pi a b)
---     where expr = quote (length scop) $
---                        eval (Env Map.empty scop) (loosen f) `vapp` (vunquoted (length scop))
---           scop = (ctxToScope ctx)
--- etaExpand ctx p (Sigma a b) = pure (Pair e1 e2, Sigma a b)
---     where e1 = quote (length scop) $ vfst $ eval (Env Map.empty scop) p
---           e2 = quote (length scop) $ vsnd $ eval (Env Map.empty scop) p
---           scop = (ctxToScope ctx)
--- etaExpand ctx p q = pure (p, q)
--- 
--- etaExpandDefHeaded :: Term -> Term
--- etaExpandDefHeaded t = t
--- 
